@@ -6,6 +6,8 @@ pipeline {
     ENV_FILE = '/opt/myapp/.env'
     COMPOSE = 'docker compose --env-file /opt/myapp/.env -f /opt/myapp/docker-compose.yaml'
     DOCKERHUB_REPO = 'smplay/my-backend'
+    DB_PASS = credentials('db-password')
+    DB_USER = credentials('db-user')
   }
 
   triggers {
@@ -13,6 +15,33 @@ pipeline {
   }
 
   stages {
+    stage('Sync Project Files') {
+      steps {
+        // Копируем yaml и conf из текущего воркспейса (куда Jenkins склонировал git) в /opt/myapp
+        sh '''
+          cp docker-compose.yaml "$APP_DIR/docker-compose.yaml"
+          cp nginx.conf "$APP_DIR/nginx.conf"
+        '''
+      }
+    }
+
+    stage('Initialize .env') {
+      steps {
+        script {
+          // Если .env не существует, создаем его с базовыми значениями
+          // Используем printf, чтобы избежать проблем с экранированием спецсимволов в паролях
+          sh '''
+            if [ ! -f "$ENV_FILE" ]; then
+              printf "POSTGRES_USER=%s\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=app_db\n" \
+                "$DB_USER" "$DB_PASS" > "$ENV_FILE"
+              echo "BACKEND_IMAGE=docker.io/smplay/my-backend:latest" >> "$ENV_FILE"
+              echo "FRONTEND_IMAGE=docker.io/${DOCKERHUB_REPO}:latest" >> "$ENV_FILE"
+            fi
+          '''
+        }
+      }
+    }
+
     stage('Check tools') {
       steps {
         sh '''

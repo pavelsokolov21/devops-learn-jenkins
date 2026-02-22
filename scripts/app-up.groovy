@@ -5,9 +5,21 @@ pipeline {
         APP_DIR  = '/opt/myapp'
         // Указываем путь к docker-compose файлу явно
         COMPOSE_FILE = "${APP_DIR}/docker-compose.yaml"
+        DB_PASS = credentials('db-password')
+        DB_USER = credentials('db-user')
     }
 
     stages {
+        stage('Sync Project Files') {
+            steps {
+                // Копируем yaml и conf из текущего воркспейса (куда Jenkins склонировал git) в /opt/myapp
+                sh '''
+                cp docker-compose.yaml "$APP_DIR/docker-compose.yaml"
+                cp nginx.conf "$APP_DIR/nginx.conf"
+                '''
+            }
+        }
+
         stage('Check Deployment Directory') {
             steps {
                 // Проверяем, существует ли директория и есть ли там docker-compose.yaml
@@ -22,6 +34,23 @@ pipeline {
                         exit 1
                     fi
                 '''
+            }
+        }
+
+        stage('Initialize .env') {
+            steps {
+                script {
+                // Если .env не существует, создаем его с базовыми значениями
+                // Используем printf, чтобы избежать проблем с экранированием спецсимволов в паролях
+                sh '''
+                    if [ ! -f "$ENV_FILE" ]; then
+                    printf "POSTGRES_USER=%s\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=app_db\n" \
+                        "$DB_USER" "$DB_PASS" > "$ENV_FILE"
+                    echo "BACKEND_IMAGE=docker.io/smplay/my-backend:latest" >> "$ENV_FILE"
+                    echo "FRONTEND_IMAGE=docker.io/smplay/my-vite-frontend:latest" >> "$ENV_FILE"
+                    fi
+                '''
+                }
             }
         }
 

@@ -3,6 +3,7 @@ pipeline {
 
     environment {
         APP_DIR  = '/opt/myapp'
+        ENV_FILE = "${APP_DIR}/.env"
         // Указываем путь к docker-compose файлу явно
         COMPOSE_FILE = "${APP_DIR}/docker-compose.yaml"
         DB_PASS = credentials('db-password')

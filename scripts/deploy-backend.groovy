@@ -3,7 +3,7 @@ pipeline {
 
   environment {
     APP_DIR = '/opt/myapp'
-    ENV_FILE = '/opt/myapp/.env'
+    ENV_FILE = "${APP_DIR}.env"
     COMPOSE = 'docker compose --env-file /opt/myapp/.env -f /opt/myapp/docker-compose.yaml'
     DOCKERHUB_REPO = 'smplay/my-backend'
     DB_PASS = credentials('db-password')

@@ -55,7 +55,7 @@ pipeline {
             }
         }
 
-        stage('Docker Compose Up') {
+        stage('Docker Compose Down') {
             steps {
                 sh '''
                     set -euo pipefail
@@ -64,7 +64,7 @@ pipeline {
                     cd "$APP_DIR"
 
                     echo "Downing containers..."
-                    docker compose down
+                    docker compose --env-file "$ENV_FILE" down
 
                     echo "Deployment status:"
                     docker compose ps

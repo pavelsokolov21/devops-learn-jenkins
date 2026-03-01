@@ -4,91 +4,48 @@ pipeline {
     environment {
         APP_DIR  = '/opt/myapp'
         ENV_FILE = "${APP_DIR}/.env"
+        DOCKER_CONTEXT = 'prod-vm'
         // Указываем путь к docker-compose файлу явно
         COMPOSE_FILE = "${APP_DIR}/docker-compose.yaml"
+        PROD_IP  = credentials('prod-vm-ip')
         DB_PASS = credentials('db-password')
         DB_USER = credentials('db-user')
     }
 
     stages {
-        stage('Sync Project Files') {
+        stage('Prepare Remote Dir & Sync') {
             steps {
-                // Копируем yaml и conf из текущего воркспейса (куда Jenkins склонировал git) в /opt/myapp
+                // Копируем файлы через scp на prod
                 sh '''
-                cp docker-compose.yaml "$APP_DIR/docker-compose.yaml"
-                cp nginx.conf "$APP_DIR/nginx.conf"
+                ssh jenkins@${PROD_IP} "rm -f ${APP_DIR}/docker-compose.yaml ${APP_DIR}/nginx.conf"
+                scp docker-compose.yaml nginx.conf jenkins@${PROD_IP}:${APP_DIR}/
                 '''
             }
         }
 
-        stage('Check Deployment Directory') {
-            steps {
-                // Проверяем, существует ли директория и есть ли там docker-compose.yaml
-                sh '''
-                    set -euo pipefail
-                    if [ ! -d "$APP_DIR" ]; then
-                        echo "ERROR: Directory $APP_DIR does not exist."
-                        exit 1
-                    fi
-                    if [ ! -f "$COMPOSE_FILE" ]; then
-                        echo "ERROR: docker-compose.yaml not found in $APP_DIR"
-                        exit 1
-                    fi
-                '''
-            }
-        }
-
-        stage('Initialize .env') {
-            steps {
-                script {
-                // Если .env не существует, создаем его с базовыми значениями
-                // Используем printf, чтобы избежать проблем с экранированием спецсимволов в паролях
-                sh '''
-                    if [ ! -f "$ENV_FILE" ]; then
-                    printf "POSTGRES_USER=%s\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=app_db\n" \
-                        "$DB_USER" "$DB_PASS" > "$ENV_FILE"
-                    echo "BACKEND_IMAGE=docker.io/smplay/my-backend:latest" >> "$ENV_FILE"
-                    echo "FRONTEND_IMAGE=docker.io/smplay/my-vite-frontend:latest" >> "$ENV_FILE"
-                    fi
-                '''
-                }
-            }
-        }
-
-        stage('Docker Compose Up') {
+        stage('Docker Deploy') {
             steps {
                 sh '''
-                    set -euo pipefail
-                    
-                    echo "Moving to $APP_DIR..."
-                    cd "$APP_DIR"
+                set -euo pipefail
 
-                    echo "Pulling latest images..."
-                    # Pull скачивает новые версии образов, указанных в docker-compose.yaml
-                    docker compose pull
+                export DOCKER_CONTEXT=${DOCKER_CONTEXT}
+                
+                # Создаем .env прямо на удаленной машине через SSH, если его нет
+                if ! ssh jenkins@${PROD_IP} "[ -f ${APP_DIR}/.env ]"; then
+                    ssh jenkins@${PROD_IP} "printf 'POSTGRES_USER=%s\\nPOSTGRES_PASSWORD=%s\\nPOSTGRES_DB=app_db\\nBACKEND_IMAGE=docker.io/smplay/my-backend:latest\\nFRONTEND_IMAGE=docker.io/smplay/my-vite-frontend:latest\\n' '${DB_USER}' '${DB_PASS}' > ${APP_DIR}/.env"
+                fi
 
-                    echo "Starting containers..."
-                    # --remove-orphans удаляет контейнеры, которых больше нет в конфиге
-                    # -d запускает в фоновом режиме
-                    docker compose up -d --remove-orphans
-
-                    echo "Deployment status:"
-                    docker compose ps
+                # Запуск деплоя через контекст
+                docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml pull
+                docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml up -d --remove-orphans
                 '''
-            }
-        }
-
-        stage('Cleanup') {
-            steps {
-                // Очистка неиспользуемых слоев и старых образов для экономии места на VM
-                sh 'docker image prune -f'
             }
         }
     }
 
     post {
         success {
-            echo "Successfully deployed to $APP_DIR"
+            sh "docker -H ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml ps"
         }
         failure {
             echo "Deployment failed. Check Jenkins console output for details."

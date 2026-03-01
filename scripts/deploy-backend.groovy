@@ -3,11 +3,14 @@ pipeline {
 
   environment {
     APP_DIR = '/opt/myapp'
-    ENV_FILE = "${APP_DIR}/.env"
-    COMPOSE = 'docker compose --env-file /opt/myapp/.env -f /opt/myapp/docker-compose.yaml'
+    DOCKER_CONTEXT = 'prod-vm'
     DOCKERHUB_REPO = 'smplay/my-backend'
+
+    PROD_IP = credentials('prod-vm-ip')
     DB_PASS = credentials('db-password')
     DB_USER = credentials('db-user')
+
+    SSH_CMD = "ssh jenkins@${PROD_IP}"
   }
 
   triggers {
@@ -15,46 +18,6 @@ pipeline {
   }
 
   stages {
-    stage('Sync Project Files') {
-      steps {
-        // Копируем yaml и conf из текущего воркспейса (куда Jenkins склонировал git) в /opt/myapp
-        sh '''
-          cp docker-compose.yaml "$APP_DIR/docker-compose.yaml"
-          cp nginx.conf "$APP_DIR/nginx.conf"
-        '''
-      }
-    }
-
-    stage('Initialize .env') {
-      steps {
-        script {
-          // Если .env не существует, создаем его с базовыми значениями
-          // Используем printf, чтобы избежать проблем с экранированием спецсимволов в паролях
-          sh '''
-            if [ ! -f "$ENV_FILE" ]; then
-              printf "POSTGRES_USER=%s\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=app_db\n" \
-                "$DB_USER" "$DB_PASS" > "$ENV_FILE"
-              echo "BACKEND_IMAGE=docker.io/smplay/my-backend:latest" >> "$ENV_FILE"
-              echo "FRONTEND_IMAGE=docker.io/${DOCKERHUB_REPO}:latest" >> "$ENV_FILE"
-            fi
-          '''
-        }
-      }
-    }
-
-    stage('Check tools') {
-      steps {
-        sh '''
-          set -euxo pipefail
-          docker version
-          docker compose version
-          curl --version
-          jq --version
-          test -f "$ENV_FILE"
-        '''
-      }
-    }
-
     stage('Find latest tag on Docker Hub') {
       steps {
         script {
@@ -75,38 +38,52 @@ pipeline {
       }
     }
 
-    stage('Deploy backend if changed') {
+    stage('Sync Config & Check .env') {
       steps {
-        sh '''
-          set -euxo pipefail
+          sh '''
+          # Синхронизируем docker-compose и nginx.conf
+          scp docker-compose.yaml nginx.conf jenkins@${PROD_IP}:${APP_DIR}/
 
-          cd "$APP_DIR"
-
-          current_image=$(grep -E '^BACKEND_IMAGE=' "$ENV_FILE" | cut -d= -f2- || true)
-          base_image="docker.io/${DOCKERHUB_REPO}"
-          new_image="${base_image}:${LATEST_TAG}"
-
-          echo "Current: ${current_image:-<none>}"
-          echo "New:     ${new_image}"
-
-          if [ "${current_image:-}" = "$new_image" ]; then
-            echo "Backend already up-to-date, nothing to do."
-            exit 0
+          # Если .env на проде нет — создаем базу (используем \\n для корректного переноса через SSH)
+          if ! ${SSH_CMD} "[ -f ${APP_DIR}/.env ]"; then
+              echo "Initializing new .env on prod..."
+              ${SSH_CMD} "printf 'POSTGRES_USER=%s\\nPOSTGRES_PASSWORD=%s\\nPOSTGRES_DB=app_db\\nFRONTEND_IMAGE=docker.io/smplay/my-vite-frontend:latest\\n' '${DB_USER}' '${DB_PASS}' > ${APP_DIR}/.env"
           fi
-
-          # Обновить/добавить BACKEND_IMAGE в .env
-          if grep -qE '^BACKEND_IMAGE=' "$ENV_FILE"; then
-            sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${new_image}|" "$ENV_FILE"
-          else
-            echo "BACKEND_IMAGE=${new_image}" >> "$ENV_FILE"
-          fi
-
-          ${COMPOSE} pull backend
-          ${COMPOSE} up -d --no-deps backend
-
-          ${COMPOSE} ps
-        '''
+          '''
       }
+    }
+
+    stage('Update Image & Deploy') {
+        steps {
+            sh '''
+            set -euo pipefail
+            NEW_IMAGE="docker.io/${DOCKERHUB_REPO}:${LATEST_TAG}"
+            
+            # Получаем текущий образ из .env на удаленной машине
+            CURRENT_IMAGE=$(${SSH_CMD} "grep '^BACKEND_IMAGE=' ${APP_DIR}/.env | cut -d= -f2-" || true)
+
+            if [ "$CURRENT_IMAGE" = "$NEW_IMAGE" ]; then
+                echo "Backend is already up-to-date ($CURRENT_IMAGE). Exit."
+                exit 0
+            fi
+
+            echo "Updating backend from $CURRENT_IMAGE to $NEW_IMAGE"
+
+            # Обновляем строку в .env на проде
+            if ${SSH_CMD} "grep -q '^BACKEND_IMAGE=' ${APP_DIR}/.env"; then
+                ${SSH_CMD} "sed -i 's|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${NEW_IMAGE}|' ${APP_DIR}/.env"
+            else
+                ${SSH_CMD} "echo 'BACKEND_IMAGE=${NEW_IMAGE}' >> ${APP_DIR}/.env"
+            fi
+
+            # Выполняем деплой через контекст
+            docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml pull backend
+            docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml up -d --no-deps backend
+            
+            echo "Deployment finished. Current status:"
+            docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml ps
+            '''
+        }
     }
   }
 }

@@ -2,12 +2,15 @@ pipeline {
   agent { label 'linux-build' } 
 
   environment {
-    APP_DIR = '/opt/myapp'
-    ENV_FILE = '/opt/myapp/.env'
-    COMPOSE = 'docker compose --env-file /opt/myapp/.env -f /opt/myapp/docker-compose.yaml'
-    DOCKERHUB_REPO = 'smplay/my-vite-frontend'
-    DB_PASS = credentials('db-password')
-    DB_USER = credentials('db-user')
+        APP_DIR = '/opt/myapp'
+        DOCKER_CONTEXT = 'prod-vm'
+        DOCKERHUB_REPO = 'smplay/my-vite-frontend'
+        
+        PROD_IP = credentials('prod-vm-ip')
+        DB_PASS = credentials('db-password')
+        DB_USER = credentials('db-user')
+        
+        SSH_CMD = "ssh jenkins@${PROD_IP}"
   }
 
   triggers {
@@ -15,46 +18,6 @@ pipeline {
   }
 
   stages {
-    stage('Sync Project Files') {
-      steps {
-        // Копируем yaml и conf из текущего воркспейса (куда Jenkins склонировал git) в /opt/myapp
-        sh '''
-          cp docker-compose.yaml "$APP_DIR/docker-compose.yaml"
-          cp nginx.conf "$APP_DIR/nginx.conf"
-        '''
-      }
-    }
-
-    stage('Initialize .env') {
-      steps {
-        script {
-          // Если .env не существует, создаем его с базовыми значениями
-          // Используем printf, чтобы избежать проблем с экранированием спецсимволов в паролях
-          sh '''
-            if [ ! -f "$ENV_FILE" ]; then
-              printf "POSTGRES_USER=%s\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=app_db\n" \
-                "$DB_USER" "$DB_PASS" > "$ENV_FILE"
-              echo "BACKEND_IMAGE=docker.io/smplay/my-backend:latest" >> "$ENV_FILE"
-              echo "FRONTEND_IMAGE=docker.io/${DOCKERHUB_REPO}:latest" >> "$ENV_FILE"
-            fi
-          '''
-        }
-      }
-    }
-
-    stage('Check tools') {
-      steps {
-        sh '''
-          set -euxo pipefail
-          docker version
-          docker compose version
-          curl --version
-          jq --version
-          test -f "$ENV_FILE"
-        '''
-      }
-    }
-
     stage('Find latest tag on Docker Hub') {
       steps {
         script {
@@ -74,44 +37,53 @@ pipeline {
       }
     }
 
-    stage('Deploy frontend if changed') {
+    stage('Sync Config & Check .env') {
       steps {
-        sh '''
-          set -euxo pipefail
+          sh '''
+          # Синхронизируем docker-compose и nginx.conf
+          scp docker-compose.yaml nginx.conf jenkins@${PROD_IP}:${APP_DIR}/
 
-          cd "$APP_DIR"
-
-          current_image=$(grep -E '^FRONTEND_IMAGE=' "$ENV_FILE" | cut -d= -f2- || true)
-          base_image="docker.io/${DOCKERHUB_REPO}"
-          new_image="${base_image}:${LATEST_TAG}"
-
-          echo "Current: ${current_image:-<none>}"
-          echo "New:     ${new_image}"
-
-          if [ "${current_image:-}" = "$new_image" ]; then
-            echo "Frontend already up-to-date, nothing to do."
-            exit 0
+          # Если .env на проде нет — создаем базу (используем \\n для корректного переноса через SSH)
+          if ! ${SSH_CMD} "[ -f ${APP_DIR}/.env ]"; then
+              echo "Initializing new .env on prod..."
+              ${SSH_CMD} "printf 'POSTGRES_USER=%s\\nPOSTGRES_PASSWORD=%s\\nPOSTGRES_DB=app_db\\nBACKEND_IMAGE=docker.io/smplay/my-backend:latest\\n' '${DB_USER}' '${DB_PASS}' > ${APP_DIR}/.env"
           fi
-
-          # Обновить/добавить FRONTEND_IMAGE в .env
-          if grep -qE '^FRONTEND_IMAGE=' "$ENV_FILE"; then
-            sed -i "s|^FRONTEND_IMAGE=.*|FRONTEND_IMAGE=${new_image}|" "$ENV_FILE"
-          else
-            echo "FRONTEND_IMAGE=${new_image}" >> "$ENV_FILE"
-          fi
-
-          # 1) скачать новый образ для frontend_build
-          ${COMPOSE} pull frontend_build
-
-          # 2) прогнать one-shot, чтобы dist попал в volume
-          ${COMPOSE} run --rm frontend_build
-
-          # 3) перезапустить nginx (подхватит обновлённый volume)
-          ${COMPOSE} up -d --no-deps nginx
-
-          ${COMPOSE} ps
-        '''
+          '''
       }
+    }
+
+    stage('Update Image & Deploy') {
+        steps {
+            sh '''
+            set -euo pipefail
+            NEW_IMAGE="docker.io/${DOCKERHUB_REPO}:${LATEST_TAG}"
+            
+            # Получаем текущий образ из .env на удаленной машине
+            CURRENT_IMAGE=$(${SSH_CMD} "grep '^FRONTEND_IMAGE=' ${APP_DIR}/.env | cut -d= -f2-" || true)
+
+            if [ "$CURRENT_IMAGE" = "$NEW_IMAGE" ]; then
+                echo "Frontend is already up-to-date ($CURRENT_IMAGE). Exit."
+                exit 0
+            fi
+
+            echo "Updating frontend from $CURRENT_IMAGE to $NEW_IMAGE"
+
+            # Обновляем строку в .env на проде
+            if ${SSH_CMD} "grep -q '^FRONTEND_IMAGE=' ${APP_DIR}/.env"; then
+                ${SSH_CMD} "sed -i 's|^FRONTEND_IMAGE=.*|FRONTEND_IMAGE=${NEW_IMAGE}|' ${APP_DIR}/.env"
+            else
+                ${SSH_CMD} "echo 'FRONTEND_IMAGE=${NEW_IMAGE}' >> ${APP_DIR}/.env"
+            fi
+
+            # Выполняем деплой через контекст
+            docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml pull frontend_build
+            docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml run --rm frontend_build
+            docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml up -d --no-deps nginx
+            
+            echo "Deployment finished. Current status:"
+            docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml ps
+            '''
+        }
     }
   }
 }

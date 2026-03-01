@@ -3,10 +3,7 @@ pipeline {
 
     environment {
         APP_DIR  = '/opt/myapp'
-        ENV_FILE = "${APP_DIR}/.env"
         DOCKER_CONTEXT = 'prod-vm'
-        // Указываем путь к docker-compose файлу явно
-        COMPOSE_FILE = "${APP_DIR}/docker-compose.yaml"
         PROD_IP  = credentials('prod-vm-ip')
         DB_PASS = credentials('db-password')
         DB_USER = credentials('db-user')
@@ -40,15 +37,6 @@ pipeline {
                 docker --context ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml up -d --remove-orphans
                 '''
             }
-        }
-    }
-
-    post {
-        success {
-            sh "docker -H ${DOCKER_CONTEXT} compose -f ${APP_DIR}/docker-compose.yaml ps"
-        }
-        failure {
-            echo "Deployment failed. Check Jenkins console output for details."
         }
     }
 }
